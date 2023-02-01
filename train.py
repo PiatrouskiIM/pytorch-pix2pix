@@ -1,77 +1,179 @@
-"""General-purpose training script for image-to-image translation.
+import os
+import torch
+import pandas as pd
+from tqdm import tqdm
 
-This script works for various models (with option '--model': e.g., pix2pix, cyclegan, colorization) and
-different datasets (with option '--dataset_mode': e.g., aligned, unaligned, single, colorization).
-You need to specify the dataset ('--dataroot'), experiment name ('--name'), and model ('--model').
+from torch.optim import lr_scheduler
+from torch.utils.data import DataLoader
+import torchvision.transforms as transforms
 
-It first creates model, dataset, and visualizer given the option.
-It then does standard network training. During the training, it also visualize/save the images, print/save the loss plot, and save models.
-The script supports continue/resume training. Use '--continue_train' to resume your previous training.
+from datasets import get_dataset
+from utils.weight_initializer import WeightInitializer
 
-Example:
-    Train a CycleGAN model:
-        python train.py --dataroot ./datasets/maps --name maps_cyclegan --model cycle_gan
-    Train a pix2pix model:
-        python train.py --dataroot ./datasets/facades --name facades_pix2pix --model pix2pix --direction BtoA
+from models.models import GeneratorUNet, Discriminator
+from ops.pix2pix_objective import Pix2pixObjective
 
-See options/base_options.py and options/train_options.py for more training options.
-See training and test tips at: https://github.com/junyanz/pytorch-CycleGAN-and-pix2pix/blob/master/docs/tips.md
-See frequently asked questions at: https://github.com/junyanz/pytorch-CycleGAN-and-pix2pix/blob/master/docs/qa.md
-"""
-import time
-from options.train_options import TrainOptions
-from data import create_dataset
-from models import create_model
-from util.visualizer import Visualizer
 
-if __name__ == '__main__':
-    opt = TrainOptions().parse()   # get training options
-    dataset = create_dataset(opt)  # create a dataset given opt.dataset_mode and other options
-    dataset_size = len(dataset)    # get the number of images in the dataset.
-    print('The number of training images = %d' % dataset_size)
+def get_scheduler(optimizer, opt):
+    """Return a learning rate scheduler
 
-    model = create_model(opt)      # create a model given opt.model and other options
-    model.setup(opt)               # regular setup: load and print networks; create schedulers
-    visualizer = Visualizer(opt)   # create a visualizer that display/save images and plots
-    total_iters = 0                # the total number of training iterations
+    Parameters:
+        optimizer          -- the optimizer of the network
+        opt (option class) -- stores all the experiment flags; needs to be a subclass of BaseOptions．　
+                              opt.lr_policy is the name of learning rate policy: linear | step | plateau | cosine
 
-    for epoch in range(opt.epoch_count, opt.n_epochs + opt.n_epochs_decay + 1):    # outer loop for different epochs; we save the model by <epoch_count>, <epoch_count>+<save_latest_freq>
-        epoch_start_time = time.time()  # timer for entire epoch
-        iter_data_time = time.time()    # timer for data loading per iteration
-        epoch_iter = 0                  # the number of training iterations in current epoch, reset to 0 every epoch
-        visualizer.reset()              # reset the visualizer: make sure it saves the results to HTML at least once every epoch
-        model.update_learning_rate()    # update learning rates in the beginning of every epoch.
-        for i, data in enumerate(dataset):  # inner loop within one epoch
-            iter_start_time = time.time()  # timer for computation per iteration
-            if total_iters % opt.print_freq == 0:
-                t_data = iter_start_time - iter_data_time
+    For 'linear', we keep the same learning rate for the first <opt.n_epochs> epochs
+    and linearly decay the rate to zero over the next <opt.n_epochs_decay> epochs.
+    For other schedulers (step, plateau, and cosine), we use the default PyTorch schedulers.
+    See https://pytorch.org/docs/stable/optim.html for more details.
+    """
+    if opt.lr_policy == 'linear':
+        def lambda_rule(epoch):
+            lr_l = 1.0 - max(0, epoch + opt.epoch_count - opt.n_epochs) / float(opt.n_epochs_decay + 1)
+            return lr_l
 
-            total_iters += opt.batch_size
-            epoch_iter += opt.batch_size
-            model.set_input(data)         # unpack data from dataset and apply preprocessing
-            model.optimize_parameters()   # calculate loss functions, get gradients, update network weights
+        scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda_rule)
+    elif opt.lr_policy == 'step':
+        scheduler = lr_scheduler.StepLR(optimizer, step_size=opt.lr_decay_iters, gamma=0.1)
+    elif opt.lr_policy == 'plateau':
+        scheduler = lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.2, threshold=0.01, patience=5)
+    elif opt.lr_policy == 'cosine':
+        scheduler = lr_scheduler.CosineAnnealingLR(optimizer, T_max=opt.n_epochs, eta_min=0)
+    else:
+        return NotImplementedError('learning rate policy [%s] is not implemented', opt.lr_policy)
+    return scheduler
 
-            if total_iters % opt.display_freq == 0:   # display images on visdom and save images to a HTML file
-                save_result = total_iters % opt.update_html_freq == 0
-                model.compute_visuals()
-                visualizer.display_current_results(model.get_current_visuals(), epoch, save_result)
 
-            if total_iters % opt.print_freq == 0:    # print training losses and save logging information to the disk
-                losses = model.get_current_losses()
-                t_comp = (time.time() - iter_start_time) / opt.batch_size
-                visualizer.print_current_losses(epoch, epoch_iter, losses, t_comp, t_data)
-                if opt.display_id > 0:
-                    visualizer.plot_current_losses(epoch, float(epoch_iter) / dataset_size, losses)
+def train_pix2pix_epoch(dataloader, coach, modules, optimizers, device="cpu"):
+    epoch_stats = []
+    for i_batch, data in enumerate(dataloader):
+        data = (data[:, :3], data[:, 3:])
+        batch_stats = {}
 
-            if total_iters % opt.save_latest_freq == 0:   # cache our latest model every <save_latest_freq> iterations
-                print('saving the latest model (epoch %d, total_iters %d)' % (epoch, total_iters))
-                save_suffix = 'iter_%d' % total_iters if opt.save_by_iter else 'latest'
-                model.save_networks(save_suffix)
+        optimizers["G"].zero_grad()
+        optimizers["D"].zero_grad()
+        loss, stats = coach.practice_discrimination(modules["G"], modules["D"], data, device)
+        loss.backward()
+        optimizers["D"].step()
+        batch_stats["D"] = stats
 
-            iter_data_time = time.time()
-        if epoch % opt.save_epoch_freq == 0:              # cache our model every <save_epoch_freq> epochs
-            print('saving the model at the end of epoch %d, iters %d' % (epoch, total_iters))
-            model.save_networks('latest')
-            model.save_networks(epoch)
+        optimizers["G"].zero_grad()
+        optimizers["D"].zero_grad()
+        loss, stats = coach.practice_generation(modules["G"], modules["D"], data, device)
+        loss.backward()
+        optimizers["G"].step()
+        batch_stats["G"] = stats
 
-        print('End of epoch %d / %d \t Time Taken: %d sec' % (epoch, opt.n_epochs + opt.n_epochs_decay, time.time() - epoch_start_time))
+        epoch_stats.append(batch_stats)
+    return epoch_stats
+
+
+def train(save_folder, dataloader, modules, num_epochs, lr, betas, save_interval=1, device="cpu", **kwargs):
+    os.makedirs(save_folder, exist_ok=True)
+
+    def _save_checkpoint(prefix):
+        for kind in modules:
+            saving_path = os.path.join(save_folder, f'{prefix}-{kind}.ckpt')
+            torch.save(modules[kind].state_dict(), saving_path)
+
+    def _save_stats():
+        records = []
+        for epoch_i, epoch_stats in enumerate(stats):
+            for batch_i, batch_stats in enumerate(epoch_stats):
+                record = {"epoch": epoch_i, "batch": batch_i}
+                for kind in batch_stats:
+                    for stat in batch_stats[kind]:
+                        joint_key = f"{kind.lower()}_{stat.lower()}_loss"
+                        record[joint_key] = batch_stats[kind][stat]
+                records.append(record)
+        pd.DataFrame.from_records(records).to_csv(os.path.join(save_folder, "statistics.csv"))
+
+    coach = Pix2pixObjective(**kwargs)
+    for kind in modules:
+        modules[kind].to(device)
+    optimizers = {kind: torch.optim.Adam(modules[kind].parameters(), lr=lr, betas=betas) for kind in modules}
+
+    stats = []
+    for i_epoch in tqdm(range(num_epochs)):
+        epoch_stats = train_pix2pix_epoch(dataloader, coach, modules, optimizers, device)
+        stats.append(epoch_stats)
+
+        if i_epoch % save_interval == 0:
+            _save_checkpoint(prefix=str(i_epoch).zfill(4))
+            _save_stats()
+
+    _save_checkpoint("last")
+    _save_stats()
+
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--epochs", type=int, default=60, help="number of epochs of training")
+    parser.add_argument("--folder", type=str, default="/home/ivan/Experiments/JAN27-FACE-PIXELED-COLORS", help="")
+    parser.add_argument("--data", type=str, default="/home/ivan/Datasets/JAN30-NPY-DATASET/train",
+                        help="name of the dataset")
+    parser.add_argument("--batch_size", type=int, default=16, help="size of the batches")
+    parser.add_argument("--lr", type=float, default=2e-4, help="adam: learning rate")
+    parser.add_argument("--b1", type=float, default=0.5, help="adam: decay of first order momentum of gradient")
+    parser.add_argument("--b2", type=float, default=0.999, help="adam: decay of first order momentum of gradient")
+    parser.add_argument("--decay_epoch", type=int, default=100, help="epoch from which to start lr decay")
+    parser.add_argument("--height", type=int, default=256, help="size of image height")
+    parser.add_argument("--workers", type=int, default=4, help="size of image height")
+    parser.add_argument("--width", type=int, default=256, help="size of i mage width")
+    parser.add_argument("--channels", type=int, default=3, help="number of image channels")
+    parser.add_argument("--sample_interval", type=int, default=500,
+                        help="interval between sampling of images from generators")
+    parser.add_argument("--checkpoint", type=str, default="facades", help="name of the dataset")
+
+    parser.add_argument("--checkpoint_interval", type=int, default=-1, help="interval between model checkpoints")
+    args = parser.parse_args()
+
+    device = "cuda"
+    size = (args.height, args.width)
+    lr, betas = args.lr, (args.b1, args.b2)
+    imgs_channels = args.channels
+    batch_size = args.batch_size
+    dataset_path = args.data
+    num_epochs = args.epochs
+    num_workers = args.workers
+    save_folder = args.folder
+    prefix = args.checkpoint
+    os.makedirs(save_folder, exist_ok=True)
+
+    load_size = (size[0]+24, size[1]+24)
+    loader_transforms = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.RandomRotation(3),
+        transforms.Resize(load_size),
+        transforms.CenterCrop(size),
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.Normalize(mean=[.5 for _ in range(9)], std=[.5 for _ in range(9)])
+    ])
+    dataset = get_dataset(dataset_path,
+                          num_src_channels=imgs_channels,
+                          num_total_channels=9,
+                          transforms=loader_transforms)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers)
+
+    modules = {"G": GeneratorUNet(), "D": Discriminator()}
+    if len(os.listdir(save_folder)):
+        for net_type in modules:
+            path = os.path.join(save_folder, f'{prefix}-{net_type}.ckpt')
+            if os.path.isfile(path):
+                modules[net_type].load_state_dict(torch.load(path))
+                print("LOADED")
+    else:
+        initializer_fuct = WeightInitializer("kaiming")
+        for net_type in modules:
+            modules[net_type].apply(initializer_fuct)
+
+    train(save_folder=save_folder,
+          num_epochs=num_epochs,
+          lr=lr,
+          betas=betas,
+          modules=modules,
+          dataloader=dataloader,
+          save_interval=1,
+          device="cuda",
+          lambda_rec=100)
